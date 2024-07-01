@@ -3,10 +3,14 @@ import pandas as pd
 import typing
 import pprint
 import urllib.parse
+import os
 from urllib.error import URLError
 from requests import HTTPError
 
-def stock_list(target:str):
+def get_stock_list(target:str):
+  old_file = 'data_jpx.csv'
+  if os.path.exists(old_file):
+    os.remove(old_file)
   jpx_df = pd.read_csv(target, dtype=str, encoding='utf8')
   jpx_df['symbol'] = jpx_df['コード'] + '.T'
   jpx_df = jpx_df[(
@@ -14,9 +18,8 @@ def stock_list(target:str):
       (jpx_df['市場・商品区分'] == 'スタンダード（内国株式）' ) |
       (jpx_df['市場・商品区分'] == 'グロース（内国株式）')
     )].copy()
-  
   ticker_df = get_ticker_list(jpx_df)
-  # ticker_df.to_csv('data_jpx.csv', header=True, index=False)
+  ticker_df.to_csv('data_jpx.csv', header=True, index=False)
 
 def get_ticker_list(symbol_df: pd.DataFrame, start_index:int=0, limit_size:int=0):
   ticker_df = None
@@ -26,7 +29,6 @@ def get_ticker_list(symbol_df: pd.DataFrame, start_index:int=0, limit_size:int=0
     if start_index > 0 and index < start_index:
       continue
     df = get_ticker(data.symbol, data.銘柄名)
-    print(df)
     count += 1
 
     if df is None:
@@ -40,18 +42,14 @@ def get_ticker_list(symbol_df: pd.DataFrame, start_index:int=0, limit_size:int=0
   return ticker_df
 
 def get_ticker(ticker_cd: str, ticker_nm: str) -> pd.DataFrame:
+  ticker_df = None
   try:
+    print(f"対象の銘柄:{ticker_cd}")
     modules = ['summaryProfile', 'financialData', 'quoteType', 'defaultKeyStatistics', 'assetProfile', 'summaryDetail']
     urllib.parse.urlencode([('ssl', 'true')] + [('module', m) for m in modules])
     
     ## データを取得
     ticker = yf.Ticker(ticker_cd)
-    help(yf.Ticker)
-    
-    # properties = dir(ticker)
-    # print("これです。")
-    # pprint.pprint(properties)
-    # print('これでした')
 
     # 基本情報（概要） - marketCap(時価総額), sharesOutstanding(発行株数), forwardPE(予測PER), dividendYield(配当利回り), profitMargins(純利益比率)
     info = ticker.info
@@ -236,15 +234,105 @@ def get_ticker(ticker_cd: str, ticker_nm: str) -> pd.DataFrame:
     if "operatingMargins" in info:
       ticker_dict["operatingMargins"] = info["operatingMargins"] # 営業利益
     if "trailingPegRatio" in info:
-      ticker_dict["trailingPegRatio"] = info["trailingPegRatio"] # 末尾ペッグレシオ ​​
+      ticker_dict["trailingPegRatio"] = info["trailingPegRatio"] # 末尾ペッグレシオ
 
-
-    ticker_df = pd.DataFrame([ticker_dict])
+    # financials
+    if (len(financials) > 0 and 
+      'Basic EPS' in financials.index and
+      'Diluted EPS' in financials.index and
+      'Basic Average Shares' in financials.index and
+      'Total Revenue' in financials.index and
+      'Net Income' in financials.index
+    ):
+      if (len(balance_sheet) > 0 and
+        'Common Stock Equity' in balance_sheet.index and
+        'Total Assets' in balance_sheet.index
+      ):
+        basic_eps_list = financials.loc['Basic EPS']
+        diluted_eps_list = financials.loc['Diluted EPS']
+        shares_list = financials.loc['Basic Average Shares']
+        revenue_list =  financials.loc['Total Revenue']
+        earnings_list = financials.loc['Net Income']
+        equity_list = balance_sheet.loc['Common Stock Equity']
+        assets_list = balance_sheet.loc['Total Assets']
+        len_nums = [len(diluted_eps_list), len(diluted_eps_list), len(shares_list), len(revenue_list), len(earnings_list), len(equity_list), len(assets_list)]
+        min_len = min(len_nums)
+        for i in range(min_len):
+          shares = shares_list.iloc[i]
+          revenue = revenue_list.iloc[i]
+          earnings = earnings_list.iloc[i]
+          equity = equity_list.iloc[i]
+          assets = assets_list.iloc[i]
+          basic_eps = basic_eps_list.iloc[i]
+          diluted_eps = diluted_eps_list.iloc[i]
+          # ROE（Return on Equity）自己資本利益率
+          # ROE = Net Income / Shareholder Equity
+          # 投下した資本に対して企業がどれだけの利潤を上げられるのか、10〜20％程度で優良企業
+          roe = 0.00
+          if equity > 0:
+            roe= round(earnings / equity * 100, 2)
+          # ROA（Return On Asset）総資産利益率
+          # ROA = Net Income / Average Total Assets
+          # 会社が持っている総資産を利用して、どの程度の利益を上げているか、5%が超えていると優良企業
+          roa = 0.00
+          if assets > 0:
+            roa = round(earnings / assets * 100, 2)
+            # EPS（Earnings Per Share）1株当たり純利益
+            eps = earnings / shares
+            # print(f"{i} ROE={roe:.2f}% ROA={roa:.2f}% EPS={diluted_eps}")
+            ticker_dict[f"revenue{i}"] = f"{revenue / 100000000:.2f}" # 売上高（億）
+            ticker_dict[f"earnings_{i}"] = f"{earnings / 100000000:.2f}" # 純利益（億）
+            ticker_dict[f"equity_{i}"] = f"{equity / 100000000:.2f}" # 純資産
+            ticker_dict[f"assets_{i}"] = f"{assets / 100000000:.2f}" # 総資産
+            ticker_dict[f"ROE_{i}"] = f"{roe:.2f}"
+            ticker_dict[f"ROA_{i}"] = f"{roa:.2f}"
+            ticker_dict[f"EPS_{i}"] = f"{diluted_eps}"
+            if "price" in ticker_dict and 'trailingEps' in ticker_dict:
+              # PER（Price Earnings Ratio）株価収益率 P/E
+              # PER ＝ 株価  / 1株あたりの当期純利益（EPS）
+              # 企業の純利益と株価の関係を示す指標
+              ticker_dict["PER"] = '0.00'
+              if  float(ticker_dict['trailingEps']) > 0.0:
+                ticker_dict["PER"] = f"{float(ticker_dict['price']) / float(ticker_dict['trailingEps']):.2f}"
+            if "price" in ticker_dict and 'sharesOutstanding' in ticker_dict and 'equity_0' in ticker_dict:
+              # PBR（Price Book-value Ratio）　株価純資産倍率 P/B
+              # PBR ＝ 株価 / 1株あたりの純資産（BPS）
+              # 企業の純資産と株価との関係を示す指標
+              ticker_dict["PBR"] = '0.00'
+              if float(ticker_dict['sharesOutstanding']) > 0.0:
+                ticker_dict["netAssetsPerShare"] = f"{float(ticker_dict['equity_0']) * 100000000 / float(ticker_dict['sharesOutstanding'])}"
+              # 1株あたりの純資産(純資産額を発行済み株式総数で割る)
+              if float(ticker_dict['netAssetsPerShare']) > 0.0:
+                ticker_dict["PBR"] = f"{float(ticker_dict['price']) / float(ticker_dict['netAssetsPerShare']):.2f}"
+                ticker_df = pd.DataFrame([ticker_dict])
+                dir(ticker_df)
   except HTTPError as e:
-    print(f'{ticker_cd} エラー : {e}')
-    return None
+      print("これはエラーです。")
+      print(f"{ticker_cd} エラー : {e}")
+      print("これはエラーです。")
+      return None
   except URLError as e:
+    print("これはエラーです。")
     print(f"{ticker_cd} エラー : {e}")
+    print("これはエラーです。")
     return None
-  
   return ticker_df
+
+def get_filtered_stock_list(target:str):
+  analysis_df = pd.read_csv(target, dtype=str, encoding='utf8')
+  jpx_stock_df = pd.read_csv('data_jpx.csv', dtype=str, encoding='utf8')
+  
+  # 条件抽出用に特定のデータのみとする
+  analysis_df = analysis_df[['symbol', 'price', 'target_price', 'dividend_yield', 'employee', 'marketCap','PBR', 'PER', 'ROE', 'ROA', 'EPS_0', 'EPS_1']]
+  
+  # 欠損値を0.0で置換
+  analysis_df.fillna('0.0', inplace=True)
+  
+  # EPS 今期がない場合は、1期前を取得する
+  analysis_df['EPS'] = analysis_df["EPS_0"]
+  analysis_df.loc[analysis_df['EPS'] == '0.0', 'EPS'] = analysis_df['EPS_1']
+  analysis_df.drop(['EPS_0', 'EPS_1'], axis=1, inplace=True)
+  
+  analysis_df['コード'] = analysis_df['symbol'].str.split('.').str[0]
+  merged_df = pd.merge(analysis_df, jpx_stock_df, on='コード', how='left')
+  merged_df.to_csv('filtered_data_jpx.csv', header=True, index=False)
